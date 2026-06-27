@@ -2,11 +2,12 @@
 /*  Cloud paper-bot — BAR-BY-BAR, no-gap version (for GitHub Actions cron).
  *  Each run processes EVERY 5-minute candle that has closed since the last run,
  *  so no entry is missed during the 15-minute sleep. For each new closed candle it:
- *    1) resolves any open trade against that candle's true high/low
- *       (conservative: if both take-profit and liquidation are touched, liquidation wins),
- *    2) evaluates the signal on that candle and opens a fresh trade if it fires.
- *  Indicators (EMA/VWAP/RSI/15m-trend) are recomputed as-of each candle's close,
- *  so a candle is judged only on data available at that moment (no look-ahead).
+ *    1) resolves any open trade: liquidation → profit-lock → take-profit,
+ *    2) opens a fresh trade only when the signal fires AND volume is firing (≥1.3x avg).
+ *  Backtested edges baked in (vs base signal, which loses): the volume-firing entry
+ *  filter turns 30-day net positive even with fees; the profit-lock (arm +45% → stop +10%)
+ *  banks near-miss winners instead of letting them round-trip to liquidation.
+ *  Indicators are recomputed as-of each candle's close (no look-ahead).
  *  State persists in state.json (committed back by the workflow). No keys, no money.
  */
 const fs = require("fs");
@@ -14,7 +15,12 @@ const path = require("path");
 
 const CFG = { targetProfitPct: 70, feePerSide: 0.02, margin: 50, leverage: 100 };
 const NOT = CFG.margin * CFG.leverage;
+const rtFee = 2 * NOT * (CFG.feePerSide / 100);   // round-trip fee in $
 const LIQ = 0.0086;
+// edge config (backtested winners): only enter on firing volume; bank near-miss winners with a profit-lock
+const VOL_FIRING = 1.3;   // entry needs volume ≥ this × the 20-bar average
+const ARM_PCT = 45;       // once profit peaks at +45% of margin…
+const LOCK_PCT = 10;      // …a stop locks in +10% (instead of letting it round-trip to liquidation)
 const FIVE_MS = 5 * 60000, FIFTEEN_MS = 15 * 60000;
 const STATE = path.join(__dirname, "state.json");
 
@@ -51,7 +57,7 @@ function signalAt(closed, f15, i){
   const e9=ema(c,9).at(-1), e21=ema(c,21).at(-1), e50=ema(c,50).at(-1);
   const vw=vwapAsOf(rowsC, closeMs); const rsiNow=rsi(c,14).at(-1);
   const vols=rowsC.map(x=>x.v), avgVol=vols.slice(-21,-1).reduce((a,b)=>a+b,0)/20;
-  const volDead=avgVol?vols.at(-1)/avgVol<0.6:false;
+  const volRatio=avgVol?vols.at(-1)/avgVol:0; const volDead=volRatio<0.6;
   // 15m trend using only 15m candles fully closed by this moment
   let mtfUp=false,mtfDown=false;
   if(f15){ const c15arr=f15.filter(x=>x.t+FIFTEEN_MS<=closeMs).map(x=>x.c);
@@ -74,7 +80,7 @@ function signalAt(closed, f15, i){
   const tgt=CFG.targetProfitPct/100, movePct=tgt/CFG.leverage, sign=cand==="short"?-1:1;
   const tp=price*(1+sign*movePct), liq=price*(1-sign*LIQ);
   const win=tgt*CFG.margin - 2*NOT*(CFG.feePerSide/100);
-  return { dir, entry:price, tp, liq, win, t:dec.t, rsi:rsiNow,
+  return { dir, entry:price, tp, liq, win, t:dec.t, rsi:rsiNow, volRatio, firing:volRatio>=VOL_FIRING,
            actionable:gPass&&dir!=null, gatesPassed:gates.filter(Boolean).length, gatesTotal:gates.length||5 };
 }
 
@@ -95,7 +101,7 @@ const f=n=>n==null?"—":n.toLocaleString("en-US",{maximumFractionDigits:1});
   if(!st.lastBar){
     const last=closed[closed.length-1];
     const s=signalAt(closed, f15, closed.length-1);
-    st.lastBar=last.t; st.wasActionable = s ? s.actionable : false;
+    st.lastBar=last.t; st.wasActionable = s ? (s.actionable && s.firing && !!s.dir) : false;
     fs.writeFileSync(STATE, JSON.stringify(st,null,2));
     console.log(`primed @ ${f(last.c)} · ${st.wasActionable?"signal armed":"wait"} · watching from here`);
     console.log(`📒 trades 0 · win-rate 0% · net $0.00`);
@@ -107,25 +113,41 @@ const f=n=>n==null?"—":n.toLocaleString("en-US",{maximumFractionDigits:1});
   for(let i=0;i<closed.length;i++){
     const bar=closed[i];
     if(bar.t<=st.lastBar) continue;
-    // 1) resolve an open trade on this bar's high/low (liquidation first if both touched)
+    // 1) resolve an open trade on this bar (liquidation → profit-lock → target).
+    //    Profit-lock: once peak profit reaches +ARM%, a stop sits at +LOCK% (banks near-miss winners).
     if(st.open){
-      const o=st.open; let hit=null,px=null;
-      if(o.dir==="long"){ if(bar.l<=o.liq){hit="LOSS";px=o.liq;} else if(bar.h>=o.tp){hit="WIN";px=o.tp;} }
-      else { if(bar.h>=o.liq){hit="LOSS";px=o.liq;} else if(bar.l<=o.tp){hit="WIN";px=o.tp;} }
-      if(hit){ const pnl=hit==="WIN"?o.win:-CFG.margin;
+      const o=st.open; const sgn=o.dir==="long"?1:-1;
+      const armPx  = o.entry*(1+sgn*(ARM_PCT/100/CFG.leverage));
+      const lockPx = o.entry*(1+sgn*(LOCK_PCT/100/CFG.leverage));
+      let hit=null,px=null;
+      if(o.dir==="long"){
+        if(bar.l<=o.liq){hit="LOSS";px=o.liq;}
+        else if(o.armed && bar.l<=lockPx){hit="LOCK";px=lockPx;}
+        else if(bar.h>=o.tp){hit="WIN";px=o.tp;}
+      } else {
+        if(bar.h>=o.liq){hit="LOSS";px=o.liq;}
+        else if(o.armed && bar.h>=lockPx){hit="LOCK";px=lockPx;}
+        else if(bar.l<=o.tp){hit="WIN";px=o.tp;}
+      }
+      if(hit){ const pnl = hit==="LOSS" ? -CFG.margin : hit==="LOCK" ? (LOCK_PCT/100*CFG.margin - rtFee) : o.win;
         st.history.push({dir:o.dir,entry:o.entry,exit:px,pnl,hit,t:bar.t});
-        console.log(`${hit==="WIN"?"✅":"💀"} CLOSE ${o.dir.toUpperCase()} @ ${f(px)} → ${pnl>=0?"+":""}$${pnl.toFixed(2)} (${hit})`);
-        st.open=null; closedN++; }
+        console.log(`${hit==="WIN"?"✅":hit==="LOCK"?"🔒":"💀"} CLOSE ${o.dir.toUpperCase()} @ ${f(px)} → ${pnl>=0?"+":""}$${pnl.toFixed(2)} (${hit})`);
+        st.open=null; closedN++;
+      } else { // not closed → ratchet the peak and arm the lock once it reaches +ARM%
+        if(o.dir==="long"){ if(bar.h>o.peak)o.peak=bar.h; if(o.peak>=armPx)o.armed=true; }
+        else { if(bar.l<o.peak)o.peak=bar.l; if(o.peak<=armPx)o.armed=true; }
+      }
     }
-    // 2) fresh entry on this closed bar (only when flat, only on a new signal)
+    // 2) fresh entry on this closed bar — needs the signal AND volume firing (the edge filter)
     const s=signalAt(closed, f15, i);
     if(s){
-      if(!st.open && s.actionable && !st.wasActionable && s.dir){
-        st.open={dir:s.dir, entry:s.entry, tp:s.tp, liq:s.liq, win:s.win, t:s.t};
-        console.log(`🟢 OPEN ${s.dir.toUpperCase()} @ ${f(s.entry)} · TP ${f(s.tp)} (+$${s.win.toFixed(2)}) · liq ${f(s.liq)}`);
+      const fire = s.actionable && s.firing && !!s.dir;
+      if(!st.open && fire && !st.wasActionable){
+        st.open={dir:s.dir, entry:s.entry, tp:s.tp, liq:s.liq, win:s.win, t:s.t, peak:s.entry, armed:false};
+        console.log(`🟢 OPEN ${s.dir.toUpperCase()} @ ${f(s.entry)} · TP ${f(s.tp)} (+$${s.win.toFixed(2)}) · liq ${f(s.liq)} · vol ${s.volRatio.toFixed(1)}x`);
         opened++;
       }
-      st.wasActionable = s.actionable;
+      st.wasActionable = fire;
     }
     st.lastBar=bar.t; changed=true;
   }
@@ -133,7 +155,9 @@ const f=n=>n==null?"—":n.toLocaleString("en-US",{maximumFractionDigits:1});
   // status line (latest closed bar)
   const last=signalAt(closed, f15, closed.length-1);
   if(last){
-    const tag=st.open?`IN ${st.open.dir.toUpperCase()}`:(last.actionable?`⚡ ${last.dir.toUpperCase()} SIGNAL`:`wait (${last.gatesPassed}/${last.gatesTotal})`);
+    const fire=last.actionable&&last.firing&&last.dir;
+    const tag=st.open?`IN ${st.open.dir.toUpperCase()}${st.open.armed?" 🔒":""}`
+      :(fire?`⚡ ${last.dir.toUpperCase()} SIGNAL`:last.actionable&&!last.firing?`wait (vol ${last.volRatio.toFixed(1)}x, need ${VOL_FIRING}x)`:`wait (${last.gatesPassed}/${last.gatesTotal})`);
     console.log(`${f(last.entry)} · ${tag} · RSI ${last.rsi?.toFixed(0)} · processed ${opened} new entr${opened===1?"y":"ies"}, ${closedN} close${closedN===1?"":"s"} this run`);
   }
 
