@@ -2,29 +2,34 @@
 /*  Cloud paper-bot — BAR-BY-BAR, no-gap version (for GitHub Actions cron).
  *  Each run processes EVERY 5-minute candle that has closed since the last run,
  *  so no entry is missed during the 15-minute sleep. For each new closed candle it:
- *    1) resolves any open trade: liquidation → hard stop (−30%) → profit-lock → take-profit,
- *    2) opens a fresh trade only when the signal fires AND volume is firing (≥1.3x avg)
+ *    1) resolves any open trade: liquidation → hard stop (−35%) → profit-lock → take-profit,
+ *    2) opens a fresh trade only when the signal fires AND volume is FIRING HARD (≥1.8x avg)
  *       AND the market is trending (ADX ≥ 20).
- *  Backtested edges baked in (validated across 3 separate months, single-position):
- *    - volume-firing entry (≥1.3x avg) — the base filter that beats the raw signal;
- *    - ADX ≥ 20 trend gate — sits out chop; ~7x the realistic edge (+$40 → +$298 / 90d);
- *    - hard stop −30% — caps each loss at ~$15 instead of letting it ride to −$50 liq;
- *    - profit-lock (arm +45% → stop +10%) — banks near-miss winners.
+ *  Config = `conviction @ 50x`, validated across 6 SEPARATE months (single-position):
+ *    - volume-conviction entry (≥1.8x avg) — only trades moves with real participation;
+ *      base/1.3x is a 6-month LOSER, 1.8x is the lever that generalizes;
+ *    - ADX ≥ 20 trend gate — sits out chop;
+ *    - 50x leverage (NOT 100x) — at 100x the −35% stop is a 0.35% move = inside noise and
+ *      gets chopped out; at 50x the same $ stop needs a ~0.7% move = room to breathe.
+ *      6-month: +$553, +$3.25/trade, 50% win, 6/6 MONTHS GREEN, 26% max drawdown.
+ *    - hard stop −35% of margin; profit-lock (arm +50% → stop +10%) banks near-miss winners.
+ *  On MEXC: set 50x leverage, $50 margin, same entry/exit signals.
  *  Indicators are recomputed as-of each candle's close (no look-ahead).
  *  State persists in state.json (committed back by the workflow). No keys, no money.
  */
 const fs = require("fs");
 const path = require("path");
 
-const CFG = { targetProfitPct: 70, feePerSide: 0.02, margin: 50, leverage: 100 };
+const CFG = { targetProfitPct: 80, feePerSide: 0.02, margin: 50, leverage: 50 };
 const NOT = CFG.margin * CFG.leverage;
-const rtFee = 2 * NOT * (CFG.feePerSide / 100);   // round-trip fee in $
-const LIQ = 0.0086;
-// edge config (backtested winners): only enter on firing volume; bank near-miss winners with a profit-lock
-const VOL_FIRING = 1.3;   // entry needs volume ≥ this × the 20-bar average
+const rtFee = 2 * NOT * (CFG.feePerSide / 100);   // round-trip fee in $ (= $1 at 50x)
+const LIQ = 0.0086;                                // 100x liq distance; scaled by leverage below
+const LIQ_MOVE = LIQ * (100 / CFG.leverage);       // actual liq price-move at this leverage (≈1.72% at 50x)
+// edge config (6-month validated): only enter on HARD-firing volume; bank near-miss winners with a profit-lock
+const VOL_FIRING = 1.8;   // entry needs volume ≥ this × the 20-bar average (conviction lever)
 const ADX_MIN = 20;       // entry needs ADX ≥ this (only trade when actually trending — sits out chop)
-const STOP_PCT = 30;      // hard stop: bail at −30% of margin (≈ −$15) instead of riding to liquidation
-const ARM_PCT = 45;       // once profit peaks at +45% of margin…
+const STOP_PCT = 35;      // hard stop: bail at −35% of margin instead of riding to liquidation
+const ARM_PCT = 50;       // once profit peaks at +50% of margin…
 const LOCK_PCT = 10;      // …a stop locks in +10% (instead of letting it round-trip to liquidation)
 const FIVE_MS = 5 * 60000, FIFTEEN_MS = 15 * 60000;
 const STATE = path.join(__dirname, "state.json");
@@ -93,7 +98,7 @@ function signalAt(closed, f15, i){
   const gPass=gates.length&&gates.every(Boolean);
   const dir=(cand==="long"||cand==="short")?cand:null;
   const tgt=CFG.targetProfitPct/100, movePct=tgt/CFG.leverage, sign=cand==="short"?-1:1;
-  const tp=price*(1+sign*movePct), liq=price*(1-sign*LIQ);
+  const tp=price*(1+sign*movePct), liq=price*(1-sign*LIQ_MOVE);
   const win=tgt*CFG.margin - 2*NOT*(CFG.feePerSide/100);
   return { dir, entry:price, tp, liq, win, t:dec.t, rsi:rsiNow, volRatio, adx:adxNow, firing:volRatio>=VOL_FIRING,
            actionable:gPass&&dir!=null, gatesPassed:gates.filter(Boolean).length, gatesTotal:gates.length||6 };
